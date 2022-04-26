@@ -21,9 +21,9 @@ import (
 
 const (
 	defaultMaxReconnectAttempts = 25
-	defaultWriteWait            = 0
-	defaultReadWait             = 0
-	defaultPingPeriod           = 0
+	defaultWriteWait            = 15 * time.Second
+	defaultReadWait             = 31 * time.Second
+	defaultPingPeriod           = 15 * time.Second
 )
 
 // WSClient is a JSON-RPC client, which uses WebSocket for communication with
