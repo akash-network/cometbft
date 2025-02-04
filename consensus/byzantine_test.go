@@ -33,7 +33,7 @@ import (
 	"github.com/tendermint/tendermint/types"
 )
 
-//----------------------------------------------
+// ----------------------------------------------
 // byzantine failures
 
 // Byzantine node sends two different prevotes (nil and blockID) to the same validator
@@ -54,7 +54,9 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 		stateStore := sm.NewStore(stateDB, sm.StoreOptions{
 			DiscardABCIResponses: false,
 		})
-		state, _ := stateStore.LoadFromDBOrGenesisDoc(genDoc)
+		state, err := sm.MakeGenesisState(genDoc)
+		require.NoError(t, err)
+		require.NoError(t, stateStore.Save(state))
 		thisConfig := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
 		defer os.RemoveAll(thisConfig.RootDir)
 		ensureDir(path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
@@ -462,7 +464,7 @@ func TestByzantineConflictingProposalsWithPartition(t *testing.T) {
 	}
 }
 
-//-------------------------------
+// -------------------------------
 // byzantine consensus functions
 
 func byzantineDecideProposalFunc(t *testing.T, height int64, round int32, cs *State, sw *p2p.Switch) {
@@ -556,7 +558,7 @@ func sendProposalAndParts(
 	}, cs.Logger)
 }
 
-//----------------------------------------
+// ----------------------------------------
 // byzantine consensus reactor
 
 type ByzantineReactor struct {
