@@ -33,7 +33,7 @@ import (
 	"github.com/tendermint/tendermint/types"
 )
 
-//----------------------------------------------
+// ----------------------------------------------
 // byzantine failures
 
 // Byzantine node sends two different prevotes (nil and blockID) to the same validator
@@ -54,7 +54,9 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 		stateStore := sm.NewStore(stateDB, sm.StoreOptions{
 			DiscardABCIResponses: false,
 		})
-		state, _ := stateStore.LoadFromDBOrGenesisDoc(genDoc)
+		state, err := sm.MakeGenesisState(genDoc)
+		require.NoError(t, err)
+		require.NoError(t, stateStore.Save(state))
 		thisConfig := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
 		defer os.RemoveAll(thisConfig.RootDir)
 		ensureDir(path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
@@ -166,13 +168,13 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 			for i, peer := range peerList {
 				if i < len(peerList)/2 {
 					bcs.Logger.Info("Signed and pushed vote", "vote", prevote1, "peer", peer)
-					p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 						Message:   &cmtcons.Vote{Vote: prevote1.ToProto()},
 						ChannelID: VoteChannel,
 					}, bcs.Logger)
 				} else {
 					bcs.Logger.Info("Signed and pushed vote", "vote", prevote2, "peer", peer)
-					p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+					p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 						Message:   &cmtcons.Vote{Vote: prevote2.ToProto()},
 						ChannelID: VoteChannel,
 					}, bcs.Logger)
@@ -462,7 +464,7 @@ func TestByzantineConflictingProposalsWithPartition(t *testing.T) {
 	}
 }
 
-//-------------------------------
+// -------------------------------
 // byzantine consensus functions
 
 func byzantineDecideProposalFunc(t *testing.T, height int64, round int32, cs *State, sw *p2p.Switch) {
@@ -519,7 +521,7 @@ func sendProposalAndParts(
 	parts *types.PartSet,
 ) {
 	// proposal
-	p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+	p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 		ChannelID: DataChannel,
 		Message:   &cmtcons.Proposal{Proposal: *proposal.ToProto()},
 	}, cs.Logger)
@@ -531,7 +533,7 @@ func sendProposalAndParts(
 		if err != nil {
 			panic(err) // TODO: wbanfield better error handling
 		}
-		p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+		p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 			ChannelID: DataChannel,
 			Message: &cmtcons.BlockPart{
 				Height: height, // This tells peer that this part applies to us.
@@ -546,17 +548,17 @@ func sendProposalAndParts(
 	prevote, _ := cs.signVote(cmtproto.PrevoteType, blockHash, parts.Header())
 	precommit, _ := cs.signVote(cmtproto.PrecommitType, blockHash, parts.Header())
 	cs.mtx.Unlock()
-	p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+	p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 		ChannelID: VoteChannel,
 		Message:   &cmtcons.Vote{Vote: prevote.ToProto()},
 	}, cs.Logger)
-	p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+	p2p.SendEnvelopeShim(peer, p2p.Envelope{ // nolint: staticcheck
 		ChannelID: VoteChannel,
 		Message:   &cmtcons.Vote{Vote: precommit.ToProto()},
 	}, cs.Logger)
 }
 
-//----------------------------------------
+// ----------------------------------------
 // byzantine consensus reactor
 
 type ByzantineReactor struct {
