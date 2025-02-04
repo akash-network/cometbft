@@ -3,10 +3,12 @@ package node
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	_ "net/http/pprof" //nolint: gosec // securely exposed on separate, optional port
 	"os"
 	"strings"
 	"time"
@@ -21,6 +23,7 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	cs "github.com/cometbft/cometbft/consensus"
 	"github.com/cometbft/cometbft/crypto"
+	"github.com/cometbft/cometbft/crypto/tmhash"
 	"github.com/cometbft/cometbft/evidence"
 	"github.com/cometbft/cometbft/light"
 
@@ -53,12 +56,10 @@ import (
 	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/cometbft/cometbft/version"
 
-	_ "net/http/pprof" //nolint: gosec // securely exposed on separate, optional port
-
 	_ "github.com/lib/pq" // provide the psql db driver
 )
 
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 
 // DBContext specifies config information for loading a new DB.
 type DBContext struct {
@@ -78,16 +79,36 @@ func DefaultDBProvider(ctx *DBContext) (dbm.DB, error) {
 	return dbm.NewDB(ctx.ID, dbType, ctx.Config.DBDir())
 }
 
-// GenesisDocProvider returns a GenesisDoc.
+// ChecksummedGenesisDoc combines a GenesisDoc together with its
+// SHA256 checksum.
+type ChecksummedGenesisDoc struct {
+	GenesisDoc     *types.GenesisDoc
+	Sha256Checksum []byte
+}
+
+// GenesisDocProvider returns a GenesisDoc together with its SHA256 checksum.
 // It allows the GenesisDoc to be pulled from sources other than the
 // filesystem, for instance from a distributed key-value store cluster.
-type GenesisDocProvider func() (*types.GenesisDoc, error)
+type GenesisDocProvider func() (ChecksummedGenesisDoc, error)
 
 // DefaultGenesisDocProviderFunc returns a GenesisDocProvider that loads
 // the GenesisDoc from the config.GenesisFile() on the filesystem.
 func DefaultGenesisDocProviderFunc(config *cfg.Config) GenesisDocProvider {
-	return func() (*types.GenesisDoc, error) {
-		return types.GenesisDocFromFile(config.GenesisFile())
+	return func() (ChecksummedGenesisDoc, error) {
+		// FIXME: find a way to stream the file incrementally,
+		// for the JSON	parser and the checksum computation.
+		// https://github.com/cometbft/cometbft/issues/1302
+		jsonBlob, err := os.ReadFile(config.GenesisFile())
+		if err != nil {
+			return ChecksummedGenesisDoc{}, fmt.Errorf("couldn't read GenesisDoc file: %w", err)
+
+		}
+		incomingChecksum := tmhash.Sum(jsonBlob)
+		genDoc, err := types.GenesisDocFromJSON(jsonBlob)
+		if err != nil {
+			return ChecksummedGenesisDoc{}, err
+		}
+		return ChecksummedGenesisDoc{GenesisDoc: genDoc, Sha256Checksum: incomingChecksum}, nil
 	}
 }
 
@@ -238,6 +259,7 @@ func BootstrapState(ctx context.Context, config *cfg.Config, dbProvider DBProvid
 			err = derr
 		}
 	}()
+
 	state, err := stateStore.Load()
 	if err != nil {
 		return err
@@ -247,7 +269,7 @@ func BootstrapState(ctx context.Context, config *cfg.Config, dbProvider DBProvid
 		return fmt.Errorf("state not empty, trying to initialize non empty state")
 	}
 
-	genState, _, err := LoadStateFromDBOrGenesisDocProvider(stateDB, DefaultGenesisDocProviderFunc(config))
+	genState, _, err := LoadStateFromDBOrGenesisDocProvider(stateStore, stateDB, DefaultGenesisDocProviderFunc(config), "")
 	if err != nil {
 		return err
 	}
@@ -307,8 +329,6 @@ func BootstrapState(ctx context.Context, config *cfg.Config, dbProvider DBProvid
 
 	return err
 }
-
-//------------------------------------------------------------------------------
 
 // Node is the highest level interface to a full CometBFT node.
 // It includes all configuration information and running services.
@@ -862,7 +882,6 @@ func NewNodeWithContext(ctx context.Context,
 	logger log.Logger,
 	options ...Option,
 ) (*Node, error) {
-
 	blockStore, stateDB, err := initDBs(config, dbProvider)
 	if err != nil {
 		return nil, err
@@ -872,9 +891,19 @@ func NewNodeWithContext(ctx context.Context,
 		DiscardABCIResponses: config.Storage.DiscardABCIResponses,
 	})
 
-	state, genDoc, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genesisDocProvider)
+	state, genDoc, err := LoadStateFromDBOrGenesisDocProvider(stateStore, stateDB, genesisDocProvider, "")
 	if err != nil {
 		return nil, err
+	}
+
+	// The key will be deleted if it existed.
+	// Not checking whether the key is there in case the genesis file was larger than
+	// the max size of a value (in rocksDB for example), which would cause the check
+	// to fail and prevent the node from booting.
+	logger.Info("deleting genesis file from database if present, the database stores a hash of the original genesis file now")
+	err = stateDB.Delete(genesisDocKey)
+	if err != nil {
+		logger.Error("Failed to delete genesis doc from DB ", err)
 	}
 
 	csMetrics, p2pMetrics, memplMetrics, smMetrics, abciMetrics := metricsProvider(genDoc.ChainID)
@@ -1468,7 +1497,7 @@ func (n *Node) Config() *cfg.Config {
 	return n.config
 }
 
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 
 func (n *Node) Listeners() []string {
 	return []string{
@@ -1536,41 +1565,93 @@ func makeNodeInfo(
 	return nodeInfo, err
 }
 
-//------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 
+var genesisDocHashKey = []byte("genesisDocHash")
 var genesisDocKey = []byte("genesisDoc")
+
+// LoadStateFromDBOrGenesisDocProviderWithConfig attempts to load the state from the
+// database, or creates one using the given genesisDocProvider. On success this also
+// returns the genesis doc loaded through the given provider.
+func LoadStateFromDBOrGenesisDocProviderWithConfig(
+	stateStore sm.BootstrapStore,
+	stateDB dbm.DB,
+	genesisDocProvider GenesisDocProvider,
+	operatorGenesisHashHex string,
+	config *cfg.Config,
+) (sm.State, *types.GenesisDoc, error) {
+	// 1. Verify genesisDoc hash in db if exists
+	genDocHash, err := stateDB.Get(genesisDocHashKey)
+	if err != nil {
+		return sm.State{}, nil, ErrRetrieveGenesisDocHash{Err: err}
+	}
+
+	csGenDoc, err := genesisDocProvider()
+	if err != nil {
+		return sm.State{}, nil, err
+	}
+
+	if err = csGenDoc.GenesisDoc.ValidateAndComplete(); err != nil {
+		return sm.State{}, nil, ErrGenesisDoc{Err: err}
+	}
+
+	checkSumStr := hex.EncodeToString(csGenDoc.Sha256Checksum)
+	if err := tmhash.ValidateSHA256(checkSumStr); err != nil {
+		const formatStr = "invalid genesis doc SHA256 checksum: %s"
+		return sm.State{}, nil, fmt.Errorf(formatStr, err)
+	}
+
+	// Validate that existing or recently saved genesis file hash matches optional --genesis_hash passed by operator
+	if operatorGenesisHashHex != "" {
+		decodedOperatorGenesisHash, err := hex.DecodeString(operatorGenesisHashHex)
+		if err != nil {
+			return sm.State{}, nil, ErrGenesisHashDecode
+		}
+		if !bytes.Equal(csGenDoc.Sha256Checksum, decodedOperatorGenesisHash) {
+			return sm.State{}, nil, ErrPassedGenesisHashMismatch
+		}
+	}
+
+	if len(genDocHash) == 0 {
+		// Save the genDoc hash in the store if it doesn't already exist for future verification
+		if err = stateDB.SetSync(genesisDocHashKey, csGenDoc.Sha256Checksum); err != nil {
+			return sm.State{}, nil, ErrSaveGenesisDocHash{Err: err}
+		}
+	} else {
+		if !bytes.Equal(genDocHash, csGenDoc.Sha256Checksum) {
+			return sm.State{}, nil, ErrLoadedGenesisDocHashMismatch
+		}
+	}
+
+	// stateStore := sm.NewStore(stateDB, sm.StoreOptions{
+	// 	DiscardABCIResponses: false,
+	// })
+
+	state, err := stateStore.LoadFromDBOrGenesisDoc(csGenDoc.GenesisDoc)
+	if err != nil {
+		return sm.State{}, nil, err
+	}
+
+	return state, csGenDoc.GenesisDoc, nil
+}
 
 // LoadStateFromDBOrGenesisDocProvider attempts to load the state from the
 // database, or creates one using the given genesisDocProvider. On success this also
 // returns the genesis doc loaded through the given provider.
+// Note that if you don't have a version of the key layout set in your DB already,
+// and no config is passed, it will default to v1.
 func LoadStateFromDBOrGenesisDocProvider(
+	stateStore sm.BootstrapStore,
 	stateDB dbm.DB,
 	genesisDocProvider GenesisDocProvider,
+	operatorGenesisHashHex string,
 ) (sm.State, *types.GenesisDoc, error) {
-	// Get genesis doc
-	genDoc, err := loadGenesisDoc(stateDB)
-	if err != nil {
-		genDoc, err = genesisDocProvider()
-		if err != nil {
-			return sm.State{}, nil, err
-		}
-		// save genesis doc to prevent a certain class of user errors (e.g. when it
-		// was changed, accidentally or not). Also good for audit trail.
-		if err := saveGenesisDoc(stateDB, genDoc); err != nil {
-			return sm.State{}, nil, err
-		}
-	}
-	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
-		DiscardABCIResponses: false,
-	})
-	state, err := stateStore.LoadFromDBOrGenesisDoc(genDoc)
-	if err != nil {
-		return sm.State{}, nil, err
-	}
-	return state, genDoc, nil
+	return LoadStateFromDBOrGenesisDocProviderWithConfig(stateStore, stateDB, genesisDocProvider, operatorGenesisHashHex, nil)
 }
 
 // panics if failed to unmarshal bytes
+//
+//nolint:unused
 func loadGenesisDoc(db dbm.DB) (*types.GenesisDoc, error) {
 	b, err := db.Get(genesisDocKey)
 	if err != nil {
@@ -1588,6 +1669,8 @@ func loadGenesisDoc(db dbm.DB) (*types.GenesisDoc, error) {
 }
 
 // panics if failed to marshal the given genesis document
+//
+//nolint:unused
 func saveGenesisDoc(db dbm.DB, genDoc *types.GenesisDoc) error {
 	b, err := cmtjson.Marshal(genDoc)
 	if err != nil {
