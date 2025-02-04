@@ -23,7 +23,13 @@ jobs:
             **/**.go
             go.mod
             go.sum
-
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - uses: KengoTODA/actions-setup-docker-compose@v1
+        with:
+          version: '2.14.2' # the full version of `docker-compose` command
       - name: Build
         working-directory: test/e2e
         # Run two make jobs in parallel, since we can't run steps in parallel.
