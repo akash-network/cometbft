@@ -118,7 +118,9 @@ func TxSearch(
 		var proof types.TxProof
 		if prove {
 			block := env.BlockStore.LoadBlock(r.Height)
-			proof = block.Data.Txs.Proof(int(r.Index)) // XXX: overflow on 32-bit machines
+			if block != nil {
+				proof = block.Data.Txs.Proof(int(r.Index)) // XXX: overflow on 32-bit machines
+			}
 		}
 
 		apiResults = append(apiResults, &ctypes.ResultTx{
