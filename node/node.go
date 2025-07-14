@@ -3,9 +3,11 @@ package node
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
+	_ "net/http/pprof" //nolint: gosec
 	"os"
 	"time"
 
@@ -38,8 +40,6 @@ import (
 	"github.com/cometbft/cometbft/types"
 	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/cometbft/cometbft/version"
-
-	_ "net/http/pprof" //nolint: gosec
 )
 
 // Node is the highest level interface to a full CometBFT node.
@@ -84,8 +84,14 @@ type Node struct {
 	pprofSrv          *http.Server
 }
 
+type Options struct {
+	stateSyncProvider statesync.StateProvider
+	reactors          map[string]p2p.Reactor
+	genesisHash       []byte
+}
+
 // Option sets a parameter for the node.
-type Option func(*Node)
+type Option func(*Options)
 
 // CustomReactors allows you to add custom reactors (name -> p2p.Reactor) to
 // the node's Switch.
@@ -100,30 +106,8 @@ type Option func(*Node)
 //   - PEX
 //   - STATESYNC
 func CustomReactors(reactors map[string]p2p.Reactor) Option {
-	return func(n *Node) {
-		for name, reactor := range reactors {
-			if existingReactor := n.sw.Reactor(name); existingReactor != nil {
-				n.sw.Logger.Info("Replacing existing reactor with a custom one",
-					"name", name, "existing", existingReactor, "custom", reactor)
-				n.sw.RemoveReactor(name, existingReactor)
-			}
-			n.sw.AddReactor(name, reactor)
-			// register the new channels to the nodeInfo
-			// NOTE: This is a bit messy now with the type casting but is
-			// cleaned up in the following version when NodeInfo is changed from
-			// and interface to a concrete type
-			if ni, ok := n.nodeInfo.(p2p.DefaultNodeInfo); ok {
-				for _, chDesc := range reactor.GetChannels() {
-					if !ni.HasChannel(chDesc.ID) {
-						ni.Channels = append(ni.Channels, chDesc.ID)
-						n.transport.AddChannel(chDesc.ID)
-					}
-				}
-				n.nodeInfo = ni
-			} else {
-				n.Logger.Error("Node info is not of type DefaultNodeInfo. Custom reactor channels can not be added.")
-			}
-		}
+	return func(n *Options) {
+		n.reactors = reactors
 	}
 }
 
@@ -131,8 +115,18 @@ func CustomReactors(reactors map[string]p2p.Reactor) Option {
 // build a State object for bootstrapping the node.
 // WARNING: this interface is considered unstable and subject to change.
 func StateProvider(stateProvider statesync.StateProvider) Option {
-	return func(n *Node) {
+	return func(n *Options) {
 		n.stateSyncProvider = stateProvider
+	}
+}
+
+// GenesisHash is used is compared against the computed hash of the
+// actual genesis file or the hash stored in the database.
+// If there is a mismatch between the hash provided via cli and the
+// hash of the genesis file or the hash in the DB, the node will not boot.
+func GenesisHash(val []byte) Option {
+	return func(n *Options) {
+		n.genesisHash = val
 	}
 }
 
@@ -202,7 +196,7 @@ func BootstrapStateWithGenProvider(ctx context.Context, config *cfg.Config, dbPr
 		return fmt.Errorf("state not empty, trying to initialize non empty state")
 	}
 
-	genState, _, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genProvider)
+	genState, _, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genProvider, "")
 	if err != nil {
 		return err
 	}
@@ -266,7 +260,9 @@ func BootstrapStateWithGenProvider(ctx context.Context, config *cfg.Config, dbPr
 //------------------------------------------------------------------------------
 
 // NewNode returns a new, ready to go, CometBFT Node.
-func NewNode(config *cfg.Config,
+func NewNode(
+	ctx context.Context,
+	config *cfg.Config,
 	privValidator types.PrivValidator,
 	nodeKey *p2p.NodeKey,
 	clientCreator proxy.ClientCreator,
@@ -276,9 +272,17 @@ func NewNode(config *cfg.Config,
 	logger log.Logger,
 	options ...Option,
 ) (*Node, error) {
-	return NewNodeWithContext(context.TODO(), config, privValidator,
-		nodeKey, clientCreator, genesisDocProvider, dbProvider,
-		metricsProvider, logger, options...)
+	return NewNodeWithContext(
+		ctx,
+		config,
+		privValidator,
+		nodeKey,
+		clientCreator,
+		genesisDocProvider,
+		dbProvider,
+		metricsProvider,
+		logger,
+		options...)
 }
 
 // NewNodeWithContext is cancellable version of NewNode.
@@ -293,21 +297,30 @@ func NewNodeWithContext(ctx context.Context,
 	logger log.Logger,
 	options ...Option,
 ) (*Node, error) {
+	opts := &Options{}
+	for _, opt := range options {
+		opt(opts)
+	}
+
 	blockStore, stateDB, err := initDBs(config, dbProvider)
 	if err != nil {
 		return nil, err
 	}
 
-	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
-		DiscardABCIResponses: config.Storage.DiscardABCIResponses,
-	})
-
-	state, genDoc, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genesisDocProvider)
+	var genesisHash string
+	if len(opts.genesisHash) != 0 {
+		genesisHash = hex.EncodeToString(opts.genesisHash)
+	}
+	state, genDoc, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genesisDocProvider, genesisHash)
 	if err != nil {
 		return nil, err
 	}
 
 	csMetrics, p2pMetrics, memplMetrics, smMetrics, abciMetrics, bsMetrics, ssMetrics := metricsProvider(genDoc.ChainID)
+
+	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
+		DiscardABCIResponses: config.Storage.DiscardABCIResponses,
+	})
 
 	// Create the proxyApp and establish connections to the ABCI app (consensus, mempool, query).
 	proxyApp, err := createAndStartProxyAppConns(clientCreator, logger, abciMetrics)
@@ -487,28 +500,49 @@ func NewNodeWithContext(ctx context.Context,
 		nodeInfo:  nodeInfo,
 		nodeKey:   nodeKey,
 
-		stateStore:       stateStore,
-		blockStore:       blockStore,
-		bcReactor:        bcReactor,
-		mempoolReactor:   mempoolReactor,
-		mempool:          mempool,
-		consensusState:   consensusState,
-		consensusReactor: consensusReactor,
-		stateSyncReactor: stateSyncReactor,
-		stateSync:        stateSync,
-		stateSyncGenesis: state, // Shouldn't be necessary, but need a way to pass the genesis state
-		pexReactor:       pexReactor,
-		evidencePool:     evidencePool,
-		proxyApp:         proxyApp,
-		txIndexer:        txIndexer,
-		indexerService:   indexerService,
-		blockIndexer:     blockIndexer,
-		eventBus:         eventBus,
+		stateStore:        stateStore,
+		blockStore:        blockStore,
+		bcReactor:         bcReactor,
+		mempoolReactor:    mempoolReactor,
+		mempool:           mempool,
+		consensusState:    consensusState,
+		consensusReactor:  consensusReactor,
+		stateSyncProvider: opts.stateSyncProvider,
+		stateSyncReactor:  stateSyncReactor,
+		stateSync:         stateSync,
+		stateSyncGenesis:  state, // Shouldn't be necessary, but need a way to pass the genesis state
+		pexReactor:        pexReactor,
+		evidencePool:      evidencePool,
+		proxyApp:          proxyApp,
+		txIndexer:         txIndexer,
+		indexerService:    indexerService,
+		blockIndexer:      blockIndexer,
+		eventBus:          eventBus,
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
-	for _, option := range options {
-		option(node)
+	for name, reactor := range opts.reactors {
+		if existingReactor := node.sw.Reactor(name); existingReactor != nil {
+			node.sw.Logger.Info("Replacing existing reactor with a custom one",
+				"name", name, "existing", existingReactor, "custom", reactor)
+			node.sw.RemoveReactor(name, existingReactor)
+		}
+		node.sw.AddReactor(name, reactor)
+		// register the new channels to the nodeInfo
+		// NOTE: This is a bit messy now with the type casting but is
+		// cleaned up in the following version when NodeInfo is changed from
+		// and interface to a concrete type
+		if ni, ok := node.nodeInfo.(p2p.DefaultNodeInfo); ok {
+			for _, chDesc := range reactor.GetChannels() {
+				if !ni.HasChannel(chDesc.ID) {
+					ni.Channels = append(ni.Channels, chDesc.ID)
+					node.transport.AddChannel(chDesc.ID)
+				}
+			}
+			node.nodeInfo = ni
+		} else {
+			node.Logger.Error("Node info is not of type DefaultNodeInfo. Custom reactor channels can not be added.")
+		}
 	}
 
 	return node, nil
