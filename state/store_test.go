@@ -56,7 +56,7 @@ func BenchmarkLoadValidators(b *testing.B) {
 	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
 		DiscardABCIResponses: false,
 	})
-	state, err := stateStore.LoadFromDBOrGenesisFile(config.GenesisFile())
+	state, err := sm.MakeGenesisStateFromFile(config.GenesisFile())
 	if err != nil {
 		b.Fatal(err)
 	}
