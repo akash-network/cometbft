@@ -751,7 +751,7 @@ func NewNode(config *cfg.Config,
 	// the max size of a value (in rocksDB for example), which would cause the check
 	// to fail and prevent the node from booting.
 	logger.Info("deleting genesis file from database if present, the database stores a hash of the original genesis file now")
-	err = stateDB.Delete(genesisDocKey)
+	err = stateDB.Delete(GenesisDocKey)
 	if err != nil {
 		logger.Error("Failed to delete genesis doc from DB ", err)
 	}
@@ -1413,8 +1413,8 @@ func makeNodeInfo(
 
 // ------------------------------------------------------------------------------
 
-var genesisDocHashKey = []byte("genesisDocHash")
-var genesisDocKey = []byte("genesisDoc")
+var GenesisDocHashKey = []byte("genesisDocHash")
+var GenesisDocKey = []byte("genesisDoc")
 
 // LoadStateFromDBOrGenesisDocProviderWithConfig attempts to load the state from the
 // database, or creates one using the given genesisDocProvider. On success this also
@@ -1426,7 +1426,7 @@ func LoadStateFromDBOrGenesisDocProviderWithConfig(
 	config *cfg.Config,
 ) (sm.State, sm.Store, *types.GenesisDoc, error) {
 	// 1. Verify genesisDoc hash in db if exists
-	genDocHash, err := stateDB.Get(genesisDocHashKey)
+	genDocHash, err := stateDB.Get(GenesisDocHashKey)
 	if err != nil {
 		return sm.State{}, nil, nil, ErrRetrieveGenesisDocHash{Err: err}
 	}
@@ -1459,7 +1459,7 @@ func LoadStateFromDBOrGenesisDocProviderWithConfig(
 
 	if len(genDocHash) == 0 {
 		// Save the genDoc hash in the store if it doesn't already exist for future verification
-		if err = stateDB.SetSync(genesisDocHashKey, csGenDoc.Sha256Checksum); err != nil {
+		if err = stateDB.SetSync(GenesisDocHashKey, csGenDoc.Sha256Checksum); err != nil {
 			return sm.State{}, nil, nil, ErrSaveGenesisDocHash{Err: err}
 		}
 	} else {
@@ -1497,7 +1497,7 @@ func LoadStateFromDBOrGenesisDocProvider(
 //
 //nolint:unused
 func loadGenesisDoc(db dbm.DB) (*types.GenesisDoc, error) {
-	b, err := db.Get(genesisDocKey)
+	b, err := db.Get(GenesisDocKey)
 	if err != nil {
 		panic(err)
 	}
@@ -1520,7 +1520,7 @@ func saveGenesisDoc(db dbm.DB, genDoc *types.GenesisDoc) error {
 	if err != nil {
 		return fmt.Errorf("failed to save genesis doc due to marshaling error: %w", err)
 	}
-	if err := db.SetSync(genesisDocKey, b); err != nil {
+	if err := db.SetSync(GenesisDocKey, b); err != nil {
 		return err
 	}
 
