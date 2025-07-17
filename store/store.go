@@ -501,3 +501,85 @@ func mustEncode(pb proto.Message) []byte {
 	}
 	return bz
 }
+
+//-----------------------------------------------------------------------------
+
+// DeleteLatestBlock removes the block pointed to by height,
+// lowering height by one.
+func (bs *BlockStore) DeleteLatestBlock() error {
+	bs.mtx.RLock()
+	targetHeight := bs.height
+	bs.mtx.RUnlock()
+
+	batch := bs.db.NewBatch()
+	defer batch.Close()
+
+	// delete what we can, skipping what's already missing, to ensure partial
+	// blocks get deleted fully.
+	if meta := bs.LoadBlockMeta(targetHeight); meta != nil {
+		if err := batch.Delete(calcBlockHashKey(meta.BlockID.Hash)); err != nil {
+			return err
+		}
+		for p := 0; p < int(meta.BlockID.PartSetHeader.Total); p++ {
+			if err := batch.Delete(calcBlockPartKey(targetHeight, p)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := batch.Delete(calcBlockCommitKey(targetHeight)); err != nil {
+		return err
+	}
+	if err := batch.Delete(calcSeenCommitKey(targetHeight)); err != nil {
+		return err
+	}
+	// delete last, so as to not leave keys built on meta.BlockID dangling
+	if err := batch.Delete(calcBlockMetaKey(targetHeight)); err != nil {
+		return err
+	}
+
+	bs.mtx.Lock()
+	defer bs.mtx.Unlock()
+	bs.height = targetHeight - 1
+	return bs.saveStateAndWriteDB(batch, "failed to delete the latest block")
+}
+
+// Contract: the caller MUST have, at least, a read lock on `bs`.
+func (bs *BlockStore) saveStateAndWriteDB(batch dbm.Batch, errMsg string) error {
+	bss := cmtstore.BlockStoreState{
+		Base:   bs.base,
+		Height: bs.height,
+	}
+	SaveBlockStoreStateBatch(&bss, batch)
+
+	err := batch.WriteSync()
+	if err != nil {
+		return fmt.Errorf("error writing batch to DB %q: (base %d, height %d): %w",
+			errMsg, bs.base, bs.height, err)
+	}
+	return nil
+}
+
+// SaveBlockStoreStateBatch persists the blockStore state to the database.
+// It uses the DB batch passed as parameter
+func SaveBlockStoreStateBatch(bsj *cmtstore.BlockStoreState, batch dbm.Batch) {
+	saveBlockStoreStateBatchInternal(bsj, nil, batch)
+}
+
+func saveBlockStoreStateBatchInternal(bsj *cmtstore.BlockStoreState, db dbm.DB, batch dbm.Batch) {
+	bytes, err := proto.Marshal(bsj)
+	if err != nil {
+		panic(fmt.Sprintf("could not marshal state bytes: %v", err))
+	}
+	if batch != nil {
+		err = batch.Set(blockStoreKey, bytes)
+	} else {
+		if db == nil {
+			panic("both 'db' and 'batch' cannot be nil")
+		}
+		err = db.SetSync(blockStoreKey, bytes)
+	}
+	if err != nil {
+		panic(err)
+	}
+}
+
