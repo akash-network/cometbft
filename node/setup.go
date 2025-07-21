@@ -584,8 +584,8 @@ func startStateSync(
 
 //------------------------------------------------------------------------------
 
-var genesisDocKey = []byte("genesisDoc")
-var genesisDocHashKey = []byte("genesisDocHash")
+var GenesisDocKey = []byte("genesisDoc")
+var GenesisDocHashKey = []byte("genesisDocHash")
 
 func LoadStateFromDBOrGenesisDocProviderWithConfig(
 	stateDB dbm.DB,
@@ -594,7 +594,7 @@ func LoadStateFromDBOrGenesisDocProviderWithConfig(
 	config *cfg.Config,
 ) (sm.State, *types.GenesisDoc, error) {
 	// 1. Verify genesisDoc hash in db if exists
-	genDocHash, err := stateDB.Get(genesisDocHashKey)
+	genDocHash, err := stateDB.Get(GenesisDocHashKey)
 	if err != nil {
 		return sm.State{}, nil, ErrRetrieveGenesisDocHash{Err: err}
 	}
@@ -627,7 +627,7 @@ func LoadStateFromDBOrGenesisDocProviderWithConfig(
 
 	if len(genDocHash) == 0 {
 		// Save the genDoc hash in the store if it doesn't already exist for future verification
-		if err = stateDB.SetSync(genesisDocHashKey, csGenDoc.Sha256Checksum); err != nil {
+		if err = stateDB.SetSync(GenesisDocHashKey, csGenDoc.Sha256Checksum); err != nil {
 			return sm.State{}, nil, ErrSaveGenesisDocHash{Err: err}
 		}
 	} else {
@@ -663,7 +663,7 @@ func LoadStateFromDBOrGenesisDocProvider(
 
 // panics if failed to unmarshal bytes
 func loadGenesisDoc(db dbm.DB) (*types.GenesisDoc, error) {
-	b, err := db.Get(genesisDocKey)
+	b, err := db.Get(GenesisDocKey)
 	if err != nil {
 		panic(err)
 	}
@@ -684,7 +684,7 @@ func saveGenesisDoc(db dbm.DB, genDoc *types.GenesisDoc) error {
 	if err != nil {
 		return fmt.Errorf("failed to save genesis doc due to marshaling error: %w", err)
 	}
-	return db.SetSync(genesisDocKey, b)
+	return db.SetSync(GenesisDocKey, b)
 }
 
 func createAndStartPrivValidatorSocketClient(
